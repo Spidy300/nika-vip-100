@@ -1132,8 +1132,9 @@ async def proxy_video(request: Request, url: str = Query(..., description="Targe
                     rewritten.append(line)
                 elif line.strip():
                     chunk_url = line if line.startswith("http") else base_url + line
-                    # Absolute URL prevents hls.js from misresolving relative paths
-                    rewritten.append(f"{base_proxy}/proxy?url={quote(chunk_url, safe='')}")
+                    # Serve segments DIRECTLY from CDN — bypasses Render bottleneck
+                    # AES keys are already proxied above via #EXT-X-KEY rewrite
+                    rewritten.append(chunk_url)
 
             return Response(
                 content="\n".join(rewritten),
