@@ -1151,9 +1151,9 @@ async def proxy_video(request: Request, url: str = Query(..., description="Targe
         # The old code created the client outside the generator which caused
         # early GC/closure → hls.js got truncated segments → infinite retry loop.
         async def stream_generator():
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
                 async with client.stream("GET", url, headers=upstream_headers) as response:
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                    async for chunk in response.aiter_bytes(chunk_size=65536):
                         yield chunk
 
         if ".key" in url:
@@ -1167,6 +1167,7 @@ async def proxy_video(request: Request, url: str = Query(..., description="Targe
             media_type=content_type,
             headers={
                 "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-store",
+                "X-Accel-Buffering": "no",
             }
         )
