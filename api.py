@@ -27,7 +27,7 @@ app.add_middleware(
 @app.middleware("http")
 async def secure_api(request: Request, call_next):
     # Allow home page (docs) and the proxy route without restrictions
-    if request.url.path in ["/", "/docs", "/redoc", "/openapi.json", "/proxy"]:
+    if request.url.path in ["/", "/docs", "/redoc", "/openapi.json", "/proxy", "/kwik-extract"]:
         return await call_next(request)
 
     # BYPASS: If running locally in development, skip the strict header checks
