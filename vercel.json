@@ -11,5 +11,31 @@
       "src": "/(.*)",
       "dest": "api.py"
     }
+  ],
+  "headers": [
+    {
+      "source": "/proxy",
+      "has": [{ "type": "query", "key": "url", "value": "(?:.*)\\.m3u8(?:.*)" }],
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=30, s-maxage=30" },
+        { "key": "CDN-Cache-Control", "value": "public, max-age=30" }
+      ]
+    },
+    {
+      "source": "/proxy",
+      "has": [{ "type": "query", "key": "url", "value": "(?:.*)\\.key(?:.*)" }],
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=86400, s-maxage=86400" },
+        { "key": "CDN-Cache-Control", "value": "public, max-age=86400" }
+      ]
+    },
+    {
+      "source": "/proxy",
+      "has": [{ "type": "query", "key": "url", "value": "(?:.*)\\.(?:ts|jpg)(?:.*)" }],
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=3600, s-maxage=3600" },
+        { "key": "CDN-Cache-Control", "value": "public, max-age=3600" }
+      ]
+    }
   ]
 }

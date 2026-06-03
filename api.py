@@ -1,6 +1,6 @@
 import base64, json, gzip, httpx, os, re, time, copy
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from dotenv import load_dotenv
@@ -26,36 +26,35 @@ app.add_middleware(
 
 @app.middleware("http")
 async def secure_api(request: Request, call_next):
-    # Allow home page (docs) and the proxy route without restrictions
-    if request.url.path in ["/", "/docs", "/redoc", "/openapi.json", "/proxy", "/kwik-extract"]:
+    # Always allow docs/health and internal proxy routes
+    if request.url.path in ["/", "/docs", "/redoc", "/openapi.json", "/proxy", "/kwik-extract", "/kwik-download"]:
         return await call_next(request)
 
-    # BYPASS: If running locally in development, skip the strict header checks
+    # Development: skip all checks
     if ENVIRONMENT.lower() == "development":
         return await call_next(request)
 
-    # 1. Check API Key
+    # 1. API Key check (covers server-to-server calls from Vercel proxy — no Origin header)
     api_key = request.headers.get(API_KEY_NAME)
     if VALID_API_KEY and api_key == VALID_API_KEY:
         return await call_next(request)
 
-    # 2. Check Origin or Referer (Production Only)
-    origin = request.headers.get("origin")
+    # 2. Browser Origin / Referer check (covers direct browser → fly.dev calls)
+    origin  = request.headers.get("origin")
     referer = request.headers.get("referer")
 
-    is_allowed = False
-    for allowed in ALLOWED_ORIGINS:
-        if (origin and origin.startswith(allowed)) or (referer and referer.startswith(allowed)):
-            is_allowed = True
-            break
-            
-    if not is_allowed:
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "Access forbidden: Invalid Origin, Referer, or API Key."}
-        )
+    if ALLOWED_ORIGINS:
+        for allowed in ALLOWED_ORIGINS:
+            if (origin and origin.startswith(allowed)) or (referer and referer.startswith(allowed)):
+                return await call_next(request)
+    else:
+        # No ALLOWED_ORIGINS configured — open access (dev fallback)
+        return await call_next(request)
 
-    return await call_next(request)
+    return JSONResponse(
+        status_code=403,
+        content={"detail": "Access forbidden: Invalid Origin, Referer, or API Key."}
+    )
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Referer": "https://www.miruro.tv/"}
 ANILIST_URL = "https://graphql.anilist.co"
@@ -1008,6 +1007,43 @@ async def get_sources(
             raise HTTPException(status_code=res.status_code, detail="Pipe request failed")
         return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
 
+@app.get("/downloads")
+async def get_downloads(
+    episodeId: str = Query(..., description="Plain-text episode ID from /episodes response"),
+    provider: str = Query(..., description="Provider name, e.g. kiwi, arc, telli"),
+    anilistId: int = Query(..., description="AniList anime ID"),
+    category: str = Query("sub", description="sub or dub"),
+):
+    """Get download links for a specific episode via the pipe's download path."""
+    enc_id = base64.urlsafe_b64encode(episodeId.encode()).decode().rstrip('=')
+    payload = {
+        "path": "download",
+        "method": "GET",
+        "query": {
+            "episodeId": enc_id,
+            "provider": provider,
+            "category": category,
+            "anilistId": anilistId,
+        },
+        "body": None,
+        "version": "0.1.0",
+    }
+    encoded_req = _encode_pipe_request(payload)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
+        if res.status_code != 200:
+            raise HTTPException(status_code=res.status_code, detail="No download links found for this episode")
+        data = _decode_pipe_response(res.text.strip())
+
+    # Normalise: if download is a bare kwik embed URL, convert to download page URL
+    if isinstance(data, dict):
+        dl = data.get("download")
+        if isinstance(dl, str) and "kwik.cx/e/" in dl:
+            data["download"] = dl.replace("/e/", "/d/")
+
+    return _proxy_deep_images(data)
+
+
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
 async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
     """The super simple sources endpoint resolving slugs (prefix-number) back to provider IDs."""
@@ -1029,6 +1065,27 @@ async def get_watch_sources(provider: str, anilist_id: int, category: str, slug:
         raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found for provider {provider}")
         
     return await get_sources(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)
+
+@app.get("/watch/{provider}/{anilist_id}/{category}/{slug}/download")
+async def get_watch_downloads(provider: str, anilist_id: int, category: str, slug: str):
+    """Get download links via slug — same pattern as /watch but returns download options."""
+    data = await _fetch_raw_episodes(anilist_id)
+    prov_data = data.get("providers", {}).get(provider, {})
+    ep_list = prov_data.get("episodes", {}).get(category, [])
+
+    target_id = None
+    for ep in ep_list:
+        orig_id = ep.get("id", "")
+        prefix = orig_id.split(":")[0] if ":" in orig_id else orig_id
+        generated = f"{prefix}-{ep.get('number')}"
+        if generated == slug:
+            target_id = orig_id
+            break
+
+    if not target_id:
+        raise HTTPException(status_code=404, detail=f"Episode slug '{slug}' not found for provider {provider}")
+
+    return await get_downloads(episodeId=target_id, provider=provider, anilistId=anilist_id, category=category)
 
 # ─── Kwik Embed Extractor ────────────────────────────────────────────
 
@@ -1053,7 +1110,9 @@ async def kwik_extract(request: Request, url: str = Query(..., description="kwik
         raise HTTPException(status_code=res.status_code, detail=f"Kwik returned HTTP {res.status_code}")
 
     html = res.text
-    base_proxy = str(request.base_url).rstrip("/").replace("http://", "https://")
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("host", request.url.netloc)
+    base_proxy = f"{proto}://{host}"
 
     # Pass 1: m3u8 URL visible directly in page source
     direct = re.search(r'https?://[^\s"<>]+\.m3u8', html)
@@ -1086,13 +1145,86 @@ async def kwik_extract(request: Request, url: str = Query(..., description="kwik
     raise HTTPException(status_code=500, detail="Could not extract .m3u8 from kwik embed. Cloudflare may have served a challenge page.")
 
 
+# ─── Kwik Direct Download Extractor ─────────────────────────────────────────
+
+@app.get("/kwik-download")
+async def kwik_download(url: str = Query(..., description="kwik.cx download or embed URL (kwik.cx/d/... or /e/...)")):
+    """Extract a direct MP4 download URL from a kwik.cx /d/ page.
+    
+    Pass either a download page URL (kwik.cx/d/ID) or an embed URL (kwik.cx/e/ID) —
+    embed URLs are automatically converted. Returns a direct CDN video URL you can
+    feed to an <a download> link or aria2c.
+    """
+    # Accept embed URLs — convert /e/ → /d/
+    if "/e/" in url:
+        url = url.replace("/e/", "/d/")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://animepahe.ru/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+    }
+
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        res = await client.get(url, headers=headers)
+
+    if res.status_code in (403, 503) or "you have been blocked" in res.text.lower():
+        raise HTTPException(
+            status_code=403,
+            detail="Kwik.cx is blocking this server IP via Cloudflare. Use /kwik-extract (HLS stream) instead."
+        )
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail=f"Kwik returned HTTP {res.status_code}")
+
+    html = res.text
+
+    # Extract hidden _token and POST action from the download form
+    token_match = re.search(r'name=["\']_token["\']\s+value=["\']([^"\']+)["\']', html)
+    if not token_match:
+        # Alternate attribute order
+        token_match = re.search(r'value=["\']([^"\']+)["\']\s+name=["\']_token["\']', html)
+
+    action_match = re.search(r'<form[^>]+action=["\']([^"\']+)["\'][^>]*method=["\'][Pp][Oo][Ss][Tt]["\']', html)
+    if not action_match:
+        action_match = re.search(r'<form[^>]+method=["\'][Pp][Oo][Ss][Tt]["\'][^>]*action=["\']([^"\']+)["\']', html)
+
+    if token_match and action_match:
+        token  = token_match.group(1)
+        action = action_match.group(1)
+
+        post_headers = {
+            **headers,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://kwik.cx",
+            "Referer": url,
+        }
+
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+            post_res = await client.post(action, data={"_token": token}, headers=post_headers)
+
+        # kwik responds with a 302 redirect pointing to the real CDN video URL
+        if post_res.status_code in (301, 302):
+            direct_url = post_res.headers.get("location", "")
+            if direct_url:
+                return {"download_url": direct_url, "source": "kwik_direct"}
+
+    raise HTTPException(
+        status_code=500,
+        detail="Could not extract download URL from kwik.cx — page structure may have changed."
+    )
+
+
 # ─── Stream Proxy ────────────────────────────────────────────────────────────
 
 @app.get("/proxy")
 async def proxy_video(request: Request, url: str = Query(..., description="Target video URL to proxy")):
     """Proxies HLS video streams to bypass Kwik's Referer block, including AES keys."""
     # Build absolute base so rewritten m3u8 URLs work from any origin
-    base_proxy = str(request.base_url).rstrip("/").replace("http://", "https://")
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("host", request.url.netloc)
+    base_proxy = f"{proto}://{host}"
 
     upstream_headers = {
         "Referer": "https://kwik.cx/",
@@ -1139,34 +1271,50 @@ async def proxy_video(request: Request, url: str = Query(..., description="Targe
                 media_type="application/vnd.apple.mpegurl",
                 headers={
                     "Access-Control-Allow-Origin": "*",
-                    "Cache-Control": "no-cache",
+                    # Short cache: playlists can update (new segments added for live/airing shows)
+                    # but 30s is enough for Vercel CDN to serve burst traffic without hammering origin.
+                    "Cache-Control": "public, max-age=30, s-maxage=30",
+                    "CDN-Cache-Control": "public, max-age=30",
                 }
             )
 
-    # ── Video chunks (.ts / .jpg) and AES keys (.key) ────────────────────────
-    else:
-        # FIX: client MUST live inside the generator so it stays open for the
-        # full stream and is properly closed when the response finishes.
-        # The old code created the client outside the generator which caused
-        # early GC/closure → hls.js got truncated segments → infinite retry loop.
-        async def stream_generator():
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-                async with client.stream("GET", url, headers=upstream_headers) as response:
-                    async for chunk in response.aiter_bytes(chunk_size=65536):
-                        yield chunk
-
-        if ".key" in url:
-            content_type = "application/octet-stream"
-        else:
-            # .ts and disguised .jpg segments are both MPEG-TS
-            content_type = "video/MP2T"
-
-        return StreamingResponse(
-            stream_generator(),
-            media_type=content_type,
+    # ── AES Decryption Keys (.key) ───────────────────────────────────────────
+    elif ".key" in url:
+        # Keys are stable for the lifetime of a stream — safe to cache at CDN edge for 24h.
+        # Previously: no-store → every key fetch hit origin. Now: CDN caches per unique URL.
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            res = await client.get(url, headers=upstream_headers)
+            if res.status_code != 200:
+                raise HTTPException(status_code=res.status_code, detail="Failed to fetch key")
+        return Response(
+            content=res.content,
+            media_type="application/octet-stream",
             headers={
                 "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-store",
-                "X-Accel-Buffering": "no",
+                "Cache-Control": "public, max-age=86400, s-maxage=86400",
+                "CDN-Cache-Control": "public, max-age=86400",
+            }
+        )
+
+    # ── Video Segments (.ts / .jpg) ──────────────────────────────────────────
+    else:
+        # BANDWIDTH FIX: Buffer the segment fully then return a cacheable Response.
+        # Previously: StreamingResponse + no-store = every .ts segment from every user
+        # hit Vercel origin, burning through the 10 GB Fast Origin Transfer quota fast.
+        # Now: buffered Response + s-maxage=3600 lets Vercel's CDN cache each unique
+        # segment URL. First user fetches from origin; subsequent users get CDN edge copy.
+        # Segments are immutable (content never changes for a given URL), so 1h cache is safe.
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            res = await client.get(url, headers=upstream_headers)
+            if res.status_code != 200:
+                raise HTTPException(status_code=res.status_code, detail="Failed to fetch segment")
+        return Response(
+            content=res.content,
+            # .ts and disguised .jpg segments are both MPEG-TS
+            media_type="video/MP2T",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=3600, s-maxage=3600",
+                "CDN-Cache-Control": "public, max-age=3600",
             }
         )
